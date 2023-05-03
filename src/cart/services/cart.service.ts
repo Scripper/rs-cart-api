@@ -1,55 +1,136 @@
 import { Injectable } from '@nestjs/common';
-
-import { v4 } from 'uuid';
-
+import { Client, ClientConfig } from 'pg';
 import { Cart } from '../models';
+
+const DEFAULT_USER_ID = "111111-1a1a1-1a1a1-1111-211a1a11aa1a";
+
+const {  DATABASE_HOST, DATABASE_PORT, DATABASE_USERNAME, DATABASE_NAME, DATABASE_PASSWORD } = process.env;
+const options: ClientConfig = {
+  host: DATABASE_HOST,
+  port: +DATABASE_PORT,
+  database: DATABASE_NAME,
+  user: DATABASE_USERNAME,
+  password: DATABASE_PASSWORD,
+  connectionTimeoutMillis: 15000,
+};
+
+export enum CartStatuses {
+  OPEN = 'OPEN',
+  ORDERED = "ORDERED",
+}
 
 @Injectable()
 export class CartService {
-  private userCarts: Record<string, Cart> = {};
 
-  findByUserId(userId: string): Cart {
-    return this.userCarts[ userId ];
+  async findByUserId(userId: string): Promise<Cart> {
+    const id = userId || DEFAULT_USER_ID;
+    const client = new Client(options);
+
+    try{
+      await client.connect();
+
+      const queryCartsText = `select * from carts where user_id = '${id}'`;
+      const result = await client.query(queryCartsText);
+
+      if (result.rows.length === 0) {
+        return null
+      }
+
+      const cart = result.rows[0];
+
+      const queryItemsText = `select * from cart_items where cart_id = '${cart.id}'`;
+      const items = (await client.query(queryItemsText)).rows;
+
+      cart.items = items.map((item) => {
+        item.product = {
+          id: item.product_id
+        }
+        return item;
+      });
+
+      return cart;
+
+    } catch(e) {
+      console.log("Error => ",e);
+    } finally {
+      await client.end();
+    }
   }
 
-  createByUserId(userId: string) {
-    const id = v4(v4());
-    const userCart = {
-      id,
-      items: [],
-    };
+  async createByUserId(userId: string): Promise<Cart> {
+    const id = userId || DEFAULT_USER_ID;
+    const now = new Date().toJSON();
 
-    this.userCarts[ userId ] = userCart;
+    const columns = "user_id, created_at, updated_at, status";
+    const values = `'${id}', '${now}', '${now}', '${CartStatuses.OPEN}'`;
+    const queryText = `INSERT INTO carts(${columns}) VALUES(${values}) RETURNING *`;
 
-    return userCart;
+    const client = new Client(options);
+
+    try {
+      await client.connect();
+      const result = await client.query(queryText);
+      if (result?.rows ){
+        return result?.rows[0] as Cart;
+      }
+      return result as Cart;
+    } catch(e) {
+      console.log(e);
+    } finally {
+      await client.end();
+    }
   }
 
-  findOrCreateByUserId(userId: string): Cart {
-    const userCart = this.findByUserId(userId);
+  async findOrCreateByUserId(userId: string): Promise<Cart> {
+    const userCart = await this.findByUserId(userId || DEFAULT_USER_ID);
 
     if (userCart) {
       return userCart;
     }
-
-    return this.createByUserId(userId);
+    return await this.createByUserId(userId);
   }
 
-  updateByUserId(userId: string, { items }: Cart): Cart {
-    const { id, ...rest } = this.findOrCreateByUserId(userId);
+  async updateByUserId(userId: string, req): Promise<Cart> {
+    const { items } = JSON.parse(req.toString());
+    const client = new Client(options);
+    await client.connect();
+
+    const { id, ...rest } = await this.findOrCreateByUserId(userId);
 
     const updatedCart = {
       id,
       ...rest,
-      items: [ ...items ],
+      items: [ ...items, ...rest.items ],
     }
 
-    this.userCarts[ userId ] = { ...updatedCart };
+    try {
+      await Promise.all(items.map((item) => {
+        const values = `'${id}', '${item.count}', '${item.product.id}'`;
+        const queryText = `insert into cart_items (cart_id, count, product_id) values(${values})`;
+        return client.query(queryText);
+      }));
 
-    return { ...updatedCart };
+      return { ...updatedCart };
+    } catch(e) {
+      console.log(e);
+    } finally {
+      await client.end();
+    }
   }
 
-  removeByUserId(userId): void {
-    this.userCarts[ userId ] = null;
+  async removeByUserId(): Promise<void> {
+    const client = new Client(options);
+
+    try {
+      await client.connect();
+      const { id } = await this.findOrCreateByUserId(DEFAULT_USER_ID);
+      const queryText = `DELETE FROM cart_items WHERE cart_id = '${id}'`
+      await client.query(queryText);
+    } catch(e) {
+      console.log(e);
+    } finally {
+      await client.end();
+    }
   }
 
 }
